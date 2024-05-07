@@ -13,7 +13,7 @@ from io import BytesIO
 
 from contextlib import nullcontext
 import torch.distributed as dist
-from collections.abc import Sequence
+
 from omegaconf import DictConfig, OmegaConf
 from torch.cuda.amp import autocast, GradScaler
 from torch.nn.parallel import DistributedDataParallel as DDP
@@ -32,6 +32,7 @@ from funasr.models.lora.utils import mark_only_lora_as_trainable
 from funasr.train_utils.set_all_random_seed import set_all_random_seed
 from funasr.train_utils.load_pretrained_model import load_pretrained_model
 from funasr.utils.misc import prepare_model_dir
+from funasr.train_utils.model_summary import model_summary
 from funasr import AutoModel
 
 
@@ -98,7 +99,7 @@ def main(**kwargs):
     if freeze_param is not None:
         if "," in freeze_param:
             freeze_param = eval(freeze_param)
-        if isinstance(freeze_param, Sequence):
+        if not isinstance(freeze_param, (list, tuple)):
             freeze_param = (freeze_param,)
         logging.info("freeze_param is not None: %s", freeze_param)
         for t in freeze_param:
@@ -106,6 +107,8 @@ def main(**kwargs):
                 if k.startswith(t + ".") or k == t:
                     logging.info(f"Setting {k}.requires_grad = False")
                     p.requires_grad = False
+    if local_rank == 0:
+        logging.info(f"{model_summary(model)}")
 
     if use_ddp:
         model = model.cuda(local_rank)
@@ -143,8 +146,6 @@ def main(**kwargs):
     else:
         model = model.to(device=kwargs.get("device", "cuda"))
 
-    if local_rank == 0:
-        logging.info(f"{model}")
     kwargs["device"] = next(model.parameters()).device
 
     # optim
@@ -180,23 +181,31 @@ def main(**kwargs):
     scaler = GradScaler(enabled=trainer.use_fp16) if trainer.use_fp16 else None
     scaler = ShardedGradScaler(enabled=trainer.use_fp16) if trainer.use_fsdp else scaler
 
-    trainer.resume_checkpoint(model=model, optim=optim, scheduler=scheduler, scaler=scaler)
+    trainer.resume_checkpoint(
+        model=model,
+        optim=optim,
+        scheduler=scheduler,
+        scaler=scaler,
+    )
 
     tensorboard_dir = os.path.join(kwargs.get("output_dir"), "tensorboard")
     os.makedirs(tensorboard_dir, exist_ok=True)
     try:
         from tensorboardX import SummaryWriter
 
-        writer = SummaryWriter(tensorboard_dir) if trainer.rank == 0 else None
+        writer = SummaryWriter(tensorboard_dir)  # if trainer.rank == 0 else None
     except:
         writer = None
 
     dataloader_tr, dataloader_val = None, None
-    for epoch in range(trainer.start_epoch, trainer.max_epoch + 1):
+    for epoch in range(trainer.start_epoch, trainer.max_epoch):
         time1 = time.perf_counter()
 
-        for data_split_i in range(dataloader.data_split_num):
-            dataloader_tr, dataloader_val = dataloader.build_iter(epoch, data_split_i=data_split_i)
+        for data_split_i in range(trainer.start_data_split_i, dataloader.data_split_num):
+            dataloader_tr, dataloader_val = dataloader.build_iter(
+                epoch, data_split_i=data_split_i, start_step=trainer.start_step
+            )
+
             trainer.train_epoch(
                 model=model,
                 optim=optim,
@@ -208,14 +217,20 @@ def main(**kwargs):
                 writer=writer,
                 data_split_i=data_split_i,
                 data_split_num=dataloader.data_split_num,
+                start_step=trainer.start_step,
             )
+            trainer.start_step = 0
+
+            torch.cuda.empty_cache()
 
         trainer.validate_epoch(
-            model=model, dataloader_val=dataloader_val, epoch=epoch, writer=writer
+            model=model, dataloader_val=dataloader_val, epoch=epoch + 1, writer=writer
         )
         scheduler.step()
-
-        trainer.save_checkpoint(epoch, model=model, optim=optim, scheduler=scheduler, scaler=scaler)
+        trainer.step_in_epoch = 0
+        trainer.save_checkpoint(
+            epoch + 1, model=model, optim=optim, scheduler=scheduler, scaler=scaler
+        )
 
         time2 = time.perf_counter()
         time_escaped = (time2 - time1) / 3600.0

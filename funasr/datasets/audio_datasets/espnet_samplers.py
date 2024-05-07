@@ -41,6 +41,7 @@ class EspnetStyleBatchSampler(DistributedSampler):
         drop_last=False,
         is_training: bool = True,
         sort_size: int = 1024,
+        start_step: int = 0,
         **kwargs,
     ):
 
@@ -70,7 +71,9 @@ class EspnetStyleBatchSampler(DistributedSampler):
         self.max_token_length = kwargs.get("max_token_length", 2048)
         self.min_token_length = kwargs.get("min_token_length", 0)
         self.length_scale_source = kwargs.get("length_scale_source", 1.0)
-
+        self.start_step = start_step
+        if self.start_step > 0:
+            logging.info(f"Warning, start_step > 0, dataloader start from step: {self.start_step}")
         # super().__init__(dataset, num_replicas=num_replicas, rank=rank,
         #                  shuffle=shuffle, drop_last=drop_last)
 
@@ -92,14 +95,25 @@ class EspnetStyleBatchSampler(DistributedSampler):
         max_len_in_batch = 0  # Tracks the max sample length within the current batch
 
         for idx in sorted_indices:
-            original_sample_length = self.dataset.get_source_len(idx)
-            if (
-                original_sample_length < self.min_token_length
-                or original_sample_length > self.max_token_length
-            ):  # Skip samples that exceed the max length
-                continue
+
+            # original_sample_length = self.dataset.get_source_len(idx)
+            # if (
+            #     original_sample_length < self.min_token_length
+            #     or original_sample_length > self.max_token_length
+            # ):  # Skip samples that exceed the max length
+            #     continue
+
+            # sample_length = 1 if self.batch_type == "example" else original_sample_length
+
             # Set sample_length based on the batch type
-            sample_length = 1 if self.batch_type == "example" else original_sample_length
+            if self.batch_type == "example":
+                sample_length = 1
+            elif self.batch_type == "token":
+                sample_length = self.dataset.get_source_len(idx) + int(
+                    self.dataset.get_target_len(idx) * 1.2
+                )
+            else:
+                sample_length = self.dataset.get_source_len(idx)
             # Calculate potential batch size with the new sample
             potential_batch_length = max(max_len_in_batch, sample_length) * (len(batch) + 1)
             # Add index to batch if it doesn't exceed batch size limit
@@ -131,8 +145,11 @@ class EspnetStyleBatchSampler(DistributedSampler):
         # Allocate the batches to the current rank
         start_idx = self.rank * batches_per_rank
         end_idx = start_idx + batches_per_rank
-        rank_batches = buffer_batches[start_idx:end_idx]
-
+        rank_batches = buffer_batches[start_idx + self.start_step : end_idx]
+        if self.start_step > 0:
+            logging.info(
+                f"Warning, rank: {self.rank}, dataloader start from step: {self.start_step}, batch_num_before: {end_idx-start_idx}, now: {len(rank_batches)}"
+            )
         # Return an iterator over the batches for the current rank
         return iter(rank_batches)
 
